@@ -9,11 +9,19 @@
 #include "session.h"
 #include "desktopportal.h"
 
+#include <kglobalaccel.h>
+#include <kglobalaccel_component_interface.h>
+#include <kglobalaccel_interface.h>
+
+#include <QAction>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusPendingCall>
 #include <QDBusPendingCallWatcher>
 #include <QLoggingCategory>
+
+#include <KLocalizedString>
+#include <KeySequenceRecorder>
 
 Q_LOGGING_CATEGORY(XdgSessionKdeSession, "xdp-kde-session")
 
@@ -113,10 +121,16 @@ Session *Session::createSession(QObject *parent, SessionType type, const QString
     QDBusConnection sessionBus = QDBusConnection::sessionBus();
 
     Session *session = nullptr;
-    if (type == ScreenCast) {
+    switch (type) {
+    case ScreenCast:
         session = new ScreenCastSession(parent, appId, path);
-    } else {
+        break;
+    case RemoteDesktop:
         session = new RemoteDesktopSession(parent, appId, path);
+        break;
+    case GlobalShortcuts:
+        session = new GlobalShortcutsSession(parent, appId, path);
+        break;
     }
 
     if (sessionBus.registerVirtualObject(path, session, QDBusConnection::VirtualObjectRegisterOption::SubPath)) {
@@ -205,4 +219,124 @@ bool RemoteDesktopSession::screenSharingEnabled() const
 void RemoteDesktopSession::setScreenSharingEnabled(bool enabled)
 {
     m_screenSharingEnabled = enabled;
+}
+
+GlobalShortcutsSession::GlobalShortcutsSession(QObject *parent, const QString &appId, const QString &path)
+    : Session(parent, appId, path)
+    , m_token(path.mid(path.lastIndexOf('/') + 1))
+    , m_globalAccelInterface(
+          new KGlobalAccelInterface(QStringLiteral("org.kde.kglobalaccel"), QStringLiteral("/kglobalaccel"), QDBusConnection::sessionBus(), this))
+    , m_component(new KGlobalAccelComponentInterface(m_globalAccelInterface->service(),
+                                                     m_globalAccelInterface->getComponent(componentName()).value().path(),
+                                                     m_globalAccelInterface->connection()))
+{
+    qDBusRegisterMetaType<KGlobalShortcutInfo>();
+    qDBusRegisterMetaType<QList<KGlobalShortcutInfo>>();
+
+    connect(m_globalAccelInterface,
+            &KGlobalAccelInterface::yourShortcutsChanged,
+            this,
+            [this](const QStringList &actionId, const QList<QKeySequence> &newKeys) {
+                Q_UNUSED(newKeys);
+                if (actionId[KGlobalAccel::ComponentUnique] == componentName()) {
+                    m_shortcuts[actionId[KGlobalAccel::ActionUnique]]->setShortcuts(newKeys);
+                    Q_EMIT shortcurtsChanged();
+                }
+            });
+    connect(m_component,
+            &KGlobalAccelComponentInterface::globalShortcutPressed,
+            this,
+            [this](const QString &componentUnique, const QString &actionUnique, quint64 timestamp) {
+                if (componentUnique != componentName())
+                    return;
+
+                Q_EMIT shortcutActivated(actionUnique, timestamp);
+            });
+    connect(m_component,
+            &KGlobalAccelComponentInterface::globalShortcutReleased,
+            this,
+            [this](const QString &componentUnique, const QString &actionUnique, quint64 timestamp) {
+                if (componentUnique != componentName())
+                    return;
+
+                Q_EMIT shortcutDeactivated(actionUnique, timestamp);
+            });
+}
+
+GlobalShortcutsSession::~GlobalShortcutsSession() = default;
+
+void GlobalShortcutsSession::restoreActions(const QVariant &shortcutsVariant)
+{
+    VariantMapMap shortcuts;
+    auto arg = shortcutsVariant.value<QDBusArgument>();
+    if (arg.currentSignature() != VariantMapMapSignature) {
+        qCWarning(XdgSessionKdeSession) << "Wrong global shortcuts type, should be " << VariantMapMapSignature << "instead of " << arg.currentSignature();
+        return;
+    }
+    arg >> shortcuts;
+
+    const QList<KGlobalShortcutInfo> shortcutInfos = m_component->allShortcutInfos();
+    QHash<QString, KGlobalShortcutInfo> shortcutInfosByName;
+    shortcutInfosByName.reserve(shortcutInfos.size());
+    for (const auto &shortcutInfo : shortcutInfos) {
+        shortcutInfosByName[shortcutInfo.uniqueName()] = shortcutInfo;
+    }
+
+    for (auto it = shortcuts.begin(), itEnd = shortcuts.end(); it != itEnd; ++it) {
+        const QString description = (*it)["description"].toString();
+        if (description.isEmpty() || it.key().isEmpty()) {
+            qCWarning(XdgSessionKdeSession) << "Shortcut without name or description" << it.key() << "for" << componentName();
+            continue;
+        }
+
+        QAction *&action = m_shortcuts[it.key()];
+        if (!action) {
+            action = new QAction(this);
+        }
+        action->setProperty("componentName", componentName());
+        action->setProperty("componentDisplayName", componentName());
+        action->setObjectName(it.key());
+        action->setText(description);
+        action->setShortcuts(shortcutInfosByName[it.key()].keys());
+        KGlobalAccel::self()->setGlobalShortcut(action, action->shortcuts());
+
+        shortcutInfosByName.remove(it.key());
+    }
+
+    // We can forget the shortcuts that aren't around anymore
+    while (!shortcutInfosByName.isEmpty()) {
+        const QString shortcutName = shortcutInfosByName.begin().key();
+        auto action = m_shortcuts.take(shortcutName);
+        KGlobalAccel::self()->removeAllShortcuts(action);
+        shortcutInfosByName.erase(shortcutInfosByName.begin());
+    }
+
+    Q_ASSERT(m_shortcuts.size() == shortcuts.size());
+}
+
+QVariant GlobalShortcutsSession::shortcutDescriptionsVariant() const
+{
+    QDBusArgument retVar;
+    retVar << shortcutDescriptions();
+    return QVariant::fromValue(retVar);
+}
+
+VariantMapMap GlobalShortcutsSession::shortcutDescriptions() const
+{
+    VariantMapMap ret;
+    for (auto it = m_shortcuts.cbegin(), itEnd = m_shortcuts.cend(); it != itEnd; ++it) {
+        QStringList triggers;
+        triggers.reserve((*it)->shortcuts().size());
+        const auto shortcuts = (*it)->shortcuts();
+        for (auto shortcut : shortcuts) {
+            triggers += shortcut.toString(QKeySequence::NativeText);
+        }
+
+        ret[it.key()] = QVariantMap{
+            {QStringLiteral("description"), (*it)->text()},
+            {QStringLiteral("triggers"), triggers.join(i18n(", "))},
+        };
+    }
+    Q_ASSERT(ret.size() == m_shortcuts.size());
+    return ret;
 }

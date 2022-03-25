@@ -8,6 +8,7 @@
 
 #include "desktopportal.h"
 
+#include "globalshortcuts.h"
 #include <QLoggingCategory>
 
 Q_LOGGING_CATEGORY(XdgDesktopPortalKdeDesktopPortal, "xdp-kde-desktop-portal")
@@ -24,6 +25,8 @@ DesktopPortal::DesktopPortal(QObject *parent)
     , m_print(new PrintPortal(this))
     , m_settings(new SettingsPortal(this))
 {
+    new GlobalShortcutsPortal(this);
+
     const QByteArray xdgCurrentDesktop = qgetenv("XDG_CURRENT_DESKTOP");
     if (xdgCurrentDesktop.compare("KDE", Qt::CaseInsensitive) == 0) {
         m_background = new BackgroundPortal(this);

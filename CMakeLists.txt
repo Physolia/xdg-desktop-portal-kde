@@ -42,6 +42,8 @@ find_package(KF5 ${KF5_MIN_VERSION} REQUIRED
     Config
     I18n
     Declarative
+    GuiAddons
+    GlobalAccel
     KIO
     Kirigami2
     Notifications
